@@ -3,16 +3,14 @@
 
 import base64
 import json
-import logging
 import operator
 
 from dateutil.relativedelta import relativedelta
+
 from odoo import _, api, fields, models
-from odoo.addons.queue_job.job import job
-from odoo.addons.web.controllers.main import CSVExport, ExcelExport
 from odoo.exceptions import UserError
 
-_logger = logging.getLogger(__name__)
+from odoo.addons.web.controllers.main import CSVExport, ExcelExport
 
 
 class DelayExport(models.Model):
@@ -21,6 +19,9 @@ class DelayExport(models.Model):
     _description = "Allow to delay the export"
 
     user_id = fields.Many2one("res.users", string="User", index=True)
+    model_description = fields.Char()
+    url = fields.Char()
+    expiration_date = fields.Date()
 
     @api.model
     def delay_export(self, data):
@@ -32,14 +33,13 @@ class DelayExport(models.Model):
     @api.model
     def _get_file_content(self, params):
         export_format = params.get("format")
-        raw_data = export_format != "csv"
 
         item_names = ("model", "fields", "ids", "domain", "import_compat", "context")
-        items = operator.itemgetter(item_names)(params)
+        items = operator.itemgetter(*item_names)(params)
         model_name, fields_name, ids, domain, import_compat, context = items
         user = self.env["res.users"].browse([context.get("uid")])
         if not user or not user.email:
-            raise UserError(_("The user doesn't have an email address."))
+            raise UserError(_("The user %s doesn't have an email address.") % user.name)
 
         model = self.env[model_name].with_context(
             import_compat=import_compat, **context
@@ -52,7 +52,7 @@ class DelayExport(models.Model):
             fields_name = [field for field in fields_name if field["name"] != "id"]
 
         field_names = [f["name"] for f in fields_name]
-        import_data = records.export_data(field_names, raw_data).get("datas", [])
+        import_data = records.export_data(field_names).get("datas", [])
 
         if import_compat:
             columns_headers = field_names
@@ -67,7 +67,6 @@ class DelayExport(models.Model):
             return xls.from_data(columns_headers, import_data)
 
     @api.model
-    @job
     def export(self, params):
         content = self._get_file_content(params)
 
@@ -76,14 +75,17 @@ class DelayExport(models.Model):
         )(params)
         user = self.env["res.users"].browse([context.get("uid")])
 
-        export_record = self.sudo().create({"user_id": user.id})
+        export_record = self.sudo().create(
+            {
+                "user_id": user.id,
+            }
+        )
 
         name = "{}.{}".format(model_name, export_format)
         attachment = self.env["ir.attachment"].create(
             {
                 "name": name,
                 "datas": base64.b64encode(content),
-                "datas_fname": name,
                 "type": "binary",
                 "res_model": self._name,
                 "res_id": export_record.id,
@@ -101,40 +103,30 @@ class DelayExport(models.Model):
         )
         date_today = fields.Date.today()
         expiration_date = fields.Date.to_string(
-            date_today + relativedelta(days=+int(time_to_live))
+            date_today + relativedelta(days=int(time_to_live) + 1)
         )
 
-        # TODO : move to email template
         odoo_bot = self.sudo().env.ref("base.partner_root")
         email_from = odoo_bot.email
         model_description = self.env[model_name]._description
-        self.env["mail.mail"].create(
+
+        export_record.write(
             {
+                "url": url,
+                "expiration_date": expiration_date,
+                "model_description": model_description,
+            }
+        )
+
+        self.env.ref("base_export_async.delay_export_mail_template").send_mail(
+            export_record.id,
+            email_values={
                 "email_from": email_from,
                 "reply_to": email_from,
-                "email_to": user.email,
-                "subject": _("Export {} {}").format(
-                    model_description, fields.Date.to_string(fields.Date.today())
-                ),
-                "body_html": _(
-                    """
-                <p>Your export is available <a href="{}">here</a>.</p>
-                <p>It will be automatically deleted the {}.</p>
-                <p>&nbsp;</p>
-                <p><span style="color: #808080;">
-                This is an automated message please do not reply.
-                </span></p>
-                """
-                ).format(url, expiration_date),
-                "auto_delete": True,
-            }
+            },
         )
 
     @api.model
     def cron_delete(self):
-        time_to_live = (
-            self.env["ir.config_parameter"].sudo().get_param("attachment.ttl", 7)
-        )
         date_today = fields.Date.today()
-        date_to_delete = date_today + relativedelta(days=-int(time_to_live))
-        self.search([("create_date", "<=", date_to_delete)]).unlink()
+        self.search([("expiration_date", "<=", date_today)]).unlink()
