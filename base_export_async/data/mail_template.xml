@@ -2,7 +2,6 @@
 <odoo noupdate="1">
     <record id="delay_export_mail_template" model="mail.template">
         <field name="name">Delay Export</field>
-        <field name="email_to">${object.user_id.email}</field>
         <field
             name="subject"
         >Export ${object.model_description} ${datetime.date.today()}</field>

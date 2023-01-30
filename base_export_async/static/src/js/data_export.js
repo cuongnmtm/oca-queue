@@ -50,6 +50,7 @@ odoo.define("base_export_async.DataExport", function (require) {
                                     this.record.getContext(),
                                 ]),
                                 import_compat: this.isCompatibleMode,
+                                user_ids: [this.record.context.uid],
                             }),
                         },
                     ],

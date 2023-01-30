@@ -16,15 +16,16 @@ from odoo.addons.web.controllers.main import CSVExport, ExcelExport
 class DelayExport(models.Model):
 
     _name = "delay.export"
-    _description = "Allow to delay the export"
+    _description = "Asynchronous Export"
 
-    user_id = fields.Many2one("res.users", string="User", index=True)
+    user_ids = fields.Many2many("res.users", string="Users", index=True)
     model_description = fields.Char()
     url = fields.Char()
     expiration_date = fields.Date()
 
     @api.model
     def delay_export(self, data):
+        """Delay the export, called from js"""
         params = json.loads(data.get("data"))
         if not self.env.user.email:
             raise UserError(_("You must set an email address to your user."))
@@ -34,12 +35,10 @@ class DelayExport(models.Model):
     def _get_file_content(self, params):
         export_format = params.get("format")
 
-        item_names = ("model", "fields", "ids", "domain", "import_compat", "context")
-        items = operator.itemgetter(*item_names)(params)
-        model_name, fields_name, ids, domain, import_compat, context = items
-        user = self.env["res.users"].browse([context.get("uid")])
-        if not user or not user.email:
-            raise UserError(_("The user %s doesn't have an email address.") % user.name)
+        items = operator.itemgetter(
+            "model", "fields", "ids", "domain", "import_compat", "context", "user_ids"
+        )(params)
+        (model_name, fields_name, ids, domain, import_compat, context, user_ids) = items
 
         model = self.env[model_name].with_context(
             import_compat=import_compat, **context
@@ -68,18 +67,27 @@ class DelayExport(models.Model):
 
     @api.model
     def export(self, params):
+        """Delayed export of a file sent by email
+
+        The ``params`` is a dict of parameters, contains:
+
+        * format: csv/excel
+        * model: model to export
+        * fields: list of fields to export, a list of dict:
+          [{'label': '', 'name': ''}]
+        * ids: list of ids to export
+        * domain: domain for the export
+        * context: context for the export (language, ...)
+        * import_compat: if the export is export/import compatible (boolean)
+        * user_ids: optional list of user ids who receive the file
+        """
         content = self._get_file_content(params)
 
-        model_name, context, export_format = operator.itemgetter(
-            "model", "context", "format"
-        )(params)
-        user = self.env["res.users"].browse([context.get("uid")])
+        items = operator.itemgetter("model", "context", "format", "user_ids")(params)
+        model_name, context, export_format, user_ids = items
+        users = self.env["res.users"].browse(user_ids)
 
-        export_record = self.sudo().create(
-            {
-                "user_id": user.id,
-            }
-        )
+        export_record = self.sudo().create({"user_ids": [(6, 0, users.ids)]})
 
         name = "{}.{}".format(model_name, export_format)
         attachment = self.env["ir.attachment"].create(
@@ -103,13 +111,12 @@ class DelayExport(models.Model):
         )
         date_today = fields.Date.today()
         expiration_date = fields.Date.to_string(
-            date_today + relativedelta(days=int(time_to_live) + 1)
+            date_today + relativedelta(days=+int(time_to_live))
         )
 
         odoo_bot = self.sudo().env.ref("base.partner_root")
         email_from = odoo_bot.email
         model_description = self.env[model_name]._description
-
         export_record.write(
             {
                 "url": url,
@@ -123,10 +130,15 @@ class DelayExport(models.Model):
             email_values={
                 "email_from": email_from,
                 "reply_to": email_from,
+                "recipient_ids": [(6, 0, users.mapped("partner_id").ids)],
             },
         )
 
     @api.model
     def cron_delete(self):
+        time_to_live = (
+            self.env["ir.config_parameter"].sudo().get_param("attachment.ttl", 7)
+        )
         date_today = fields.Date.today()
-        self.search([("expiration_date", "<=", date_today)]).unlink()
+        date_to_delete = date_today + relativedelta(days=-int(time_to_live))
+        self.search([("create_date", "<=", date_to_delete)]).unlink()
